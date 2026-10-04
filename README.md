@@ -77,3 +77,13 @@ automatically; other host variables require `--build-musl-env`.
 The host Cargo home is mounted read-write at `/cargo-home`. This reuses registry
 and Git dependency downloads, and also makes the host Cargo configuration and
 credentials visible inside the build container.
+
+Ctrl+C (SIGINT) and SIGTERM cancel the build and force-remove its uniquely named
+container, returning exit codes 130 and 143 respectively. Project files and
+Cargo caches are retained. SIGKILL cannot be handled.
+
+To run the real-container cancellation regression with a cached `rust:alpine`:
+
+```sh
+cargo test --test cancellation -- --ignored --nocapture
+```

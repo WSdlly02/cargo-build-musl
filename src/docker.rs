@@ -1,8 +1,16 @@
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cargo_metadata::Message;
 
@@ -83,6 +91,15 @@ pub fn build_command(spec: &BuildSpec<'_>) -> Result<Command> {
     command
         .arg("run")
         .arg("--rm")
+        .arg("--name")
+        .arg(format!(
+            "cargo-build-musl-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
         .arg("--pull")
         .arg(spec.pull.as_str())
         .arg("--mount")
@@ -135,6 +152,18 @@ pub fn build_command(spec: &BuildSpec<'_>) -> Result<Command> {
 }
 
 pub fn run_build(mut command: Command, host_target: &Path) -> Result<BuildResult> {
+    let name = command
+        .get_args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|pair| pair[0] == "--name")
+        .map(|pair| pair[1].to_owned())
+        .ok_or_else(|| Error::Message("build container has no name".into()))?;
+    let signals = BuildSignals::new()?;
+    // Own cancellation centrally: terminal SIGINT must not kill the attached
+    // engine client before we have removed its container.
+    #[cfg(unix)]
+    command.process_group(0);
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -149,13 +178,101 @@ pub fn run_build(mut command: Command, host_target: &Path) -> Result<BuildResult
         .take()
         .ok_or_else(|| Error::Message("failed to capture Docker stdout".to_owned()))?;
 
-    let executables = read_messages(stdout, host_target);
-    let status = child.wait().map_err(Error::BuildOutput)?;
+    let target = host_target.to_owned();
+    let reader = thread::spawn(move || read_messages(stdout, &target));
+    let status = loop {
+        let signal = signals.received.load(Ordering::Relaxed);
+        if signal != 0 {
+            eprintln!(
+                "   Cancelling build; removing container {}",
+                name.to_string_lossy()
+            );
+            // First remove while the engine client is still attached. Then reap
+            // the client (also cancels a pending image pull), and remove again to
+            // cover a container being created concurrently with cancellation.
+            let _ = remove_container(&name);
+            let _ = child.kill();
+            child.wait().map_err(Error::BuildOutput)?;
+            remove_container(&name)?;
+            return Ok(BuildResult {
+                status_code: 128 + signal as i32,
+                executables: Vec::new(),
+            });
+        }
+        if let Some(status) = child.try_wait().map_err(Error::BuildOutput)? {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let executables = reader
+        .join()
+        .map_err(|_| Error::Message("build output reader panicked".into()))?;
 
     Ok(BuildResult {
         status_code: status.code().unwrap_or(1),
         executables: executables?,
     })
+}
+
+struct BuildSignals {
+    received: Arc<AtomicUsize>,
+    registrations: Vec<signal_hook::SigId>,
+}
+
+impl BuildSignals {
+    fn new() -> Result<Self> {
+        let mut signals = Self {
+            received: Arc::new(AtomicUsize::new(0)),
+            registrations: Vec::new(),
+        };
+        for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+            signals.registrations.push(
+                signal_hook::flag::register_usize(
+                    signal,
+                    Arc::clone(&signals.received),
+                    signal as usize,
+                )
+                .map_err(|error| {
+                    Error::Message(format!("cannot install build signal handler: {error}"))
+                })?,
+            );
+        }
+        Ok(signals)
+    }
+}
+
+impl Drop for BuildSignals {
+    fn drop(&mut self) {
+        for id in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+fn remove_container(name: &OsStr) -> Result<()> {
+    let mut command = Command::new("docker");
+    #[cfg(unix)]
+    command.process_group(0);
+    let output = command
+        .args([OsStr::new("rm"), OsStr::new("--force"), name])
+        .output()
+        .map_err(|source| Error::Spawn {
+            program: "docker rm",
+            source,
+        })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success()
+        || stderr.contains("No such container")
+        || stderr.contains("no such container")
+    {
+        Ok(())
+    } else {
+        Err(Error::Message(format!(
+            "failed to remove build container `{}`: {}",
+            name.to_string_lossy(),
+            stderr.trim()
+        )))
+    }
 }
 
 fn read_messages(stdout: impl Read, host_target: &Path) -> Result<Vec<PathBuf>> {
