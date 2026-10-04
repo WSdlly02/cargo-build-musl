@@ -1,12 +1,12 @@
 [package]
 name = "cargo-build-musl"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Build static musl binaries in an official Rust Alpine container"
 
 [dependencies]
 cargo_metadata = "0.23.1"
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 goblin = "0.10.7"
-thiserror = "2.0.19"
-signal-hook = "0.3.18"
+signal-hook = "0.4.5"
+thiserror = "2.0.21"
